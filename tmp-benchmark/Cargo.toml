@@ -1,0 +1,17 @@
+[package]
+name = "regex-contention-repro-work"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "repro"
+path = "main.rs"
+
+[dependencies]
+anyhow = "1.0.66"
+regex = { path = "../" }
+
+[workspace]
+
+[profile.release]
+debug = 1
