@@ -349,6 +349,60 @@ mod inner {
         };
     );
 
+    trait ParallelStack<T> {
+        fn pop(&self, caller: usize) -> Option<T>;
+        fn push(&self, value: T, caller: usize);
+    }
+
+    #[derive(Debug)]
+    struct MutexStack<T> {
+        stacks: Vec<Mutex<Vec<T>>>,
+    }
+
+    impl<T> MutexStack<T> {
+        pub fn new() -> Self {
+            let mut stacks = Vec::with_capacity(MAX_POOL_STACKS);
+            for _ in 0..MAX_POOL_STACKS {
+                stacks.push(Mutex::new(vec![]));
+            }
+            Self { stacks }
+        }
+    }
+
+    impl<T> ParallelStack<T> for MutexStack<T> {
+        fn pop(&self, caller: usize) -> Option<T> {
+            let stack_id = caller % MAX_POOL_STACKS;
+            let mut stack = self.stacks[stack_id].lock().unwrap();
+            stack.pop()
+        }
+        fn push(&self, value: T, caller: usize) {
+            let caller = THREAD_ID.with(|id| *id);
+            let stack_id = caller % MAX_POOL_STACKS;
+            let mut stack = self.stacks[stack_id].lock().unwrap();
+            stack.push(value);
+        }
+    }
+
+    #[derive(Debug)]
+    struct LockFreeStack<T> {
+        inner: minimal_lock_free_stack::Stack<T>,
+    }
+
+    impl<T> LockFreeStack<T> {
+        pub fn new() -> Self {
+            Self { inner: minimal_lock_free_stack::Stack::new() }
+        }
+    }
+
+    impl<T> ParallelStack<T> for LockFreeStack<T> {
+        fn pop(&self, _caller: usize) -> Option<T> {
+            self.inner.pop()
+        }
+        fn push(&self, value: T, _caller: usize) {
+            self.inner.push(value);
+        }
+    }
+
     /// A thread safe pool utilizing std-only features.
     ///
     /// The main difference between this and the simplistic alloc-only pool is
@@ -362,7 +416,9 @@ mod inner {
         create: F,
         /// A stack of T values to hand out. These are used when a Pool is
         /// accessed by a thread that didn't create it.
-        stacks: Vec<Mutex<Vec<Box<T>>>>,
+        /* stack: Box<dyn ParallelStack<Box<T>>>, */
+        /* stack: MutexStack<Box<T>>, */
+        stack: LockFreeStack<Box<T>>,
         /// The ID of the thread that owns this pool. The owner is the thread
         /// that makes the first call to 'get'. When the owner calls 'get', it
         /// gets 'owner_val' directly instead of returning a T from 'stack'.
@@ -384,7 +440,7 @@ mod inner {
     // behind an Arc, we need for it to be Sync. In cases where T is sync,
     // Pool<T> would be Sync. However, since we use a Pool to store mutable
     // scratch space, we wind up using a T that has interior mutability and is
-    // thus itself not Sync. So what we *really* want is for our Pool<T> to by
+    // thus itself not Sync. So what we *really* want is for our Pool<T> to be
     // Sync even when T is not Sync (but is at least Send).
     //
     // The only non-sync aspect of a Pool is its 'owner_val' field, which is
@@ -433,13 +489,13 @@ mod inner {
             // 'Pool::new' method as 'const' too. (The alloc-only Pool::new
             // is already 'const', so that should "just work" too.) The only
             // thing we're waiting for is Mutex::new to be const.
-            let mut stacks = Vec::with_capacity(MAX_POOL_STACKS);
-            for _ in 0..MAX_POOL_STACKS {
-                stacks.push(Mutex::new(vec![]));
-            }
+            /* let stack = MutexStack::<Box<T>>::new(); */
+            assert!(minimal_lock_free_stack::HAS_WIDE_ATOMIC);
+            assert!(minimal_lock_free_stack::is_lock_free());
+            let stack = LockFreeStack::<Box<T>>::new();
             let owner = AtomicUsize::new(THREAD_ID_UNOWNED);
             let owner_val = UnsafeCell::new(None); // init'd on first access
-            Pool { create, stacks, owner, owner_val }
+            Pool { create, stack, owner, owner_val }
         }
     }
 
@@ -509,9 +565,7 @@ mod inner {
                     return self.guard_owned(caller);
                 }
             }
-            let stack_id = caller % MAX_POOL_STACKS;
-            let mut stack = self.stacks[stack_id].lock().unwrap();
-            let value = match stack.pop() {
+            let value = match self.stack.pop(caller) {
                 None => Box::new((self.create)()),
                 Some(value) => value,
             };
@@ -523,9 +577,7 @@ mod inner {
         /// into the pool automatically.
         fn put_value(&self, value: Box<T>) {
             let caller = THREAD_ID.with(|id| *id);
-            let stack_id = caller % MAX_POOL_STACKS;
-            let mut stack = self.stacks[stack_id].lock().unwrap();
-            stack.push(value);
+            self.stack.push(value, caller);
         }
 
         /// Create a guard that represents the special owned T.
@@ -542,7 +594,7 @@ mod inner {
     impl<T: core::fmt::Debug, F> core::fmt::Debug for Pool<T, F> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.debug_struct("Pool")
-                .field("stacks", &self.stacks)
+                .field("stack", &self.stack)
                 .field("owner", &self.owner)
                 .field("owner_val", &self.owner_val)
                 .finish()

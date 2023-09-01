@@ -176,7 +176,7 @@ optional = true
 path = "regex-automata"
 version = "0.3.7"
 default-features = false
-features = ["alloc", "syntax", "meta", "nfa-pikevm"]
+features = ["alloc", "syntax", "meta", "nfa-pikevm", "atomic-shared-cache"]
 
 # For parsing regular expressions.
 [dependencies.regex-syntax]
